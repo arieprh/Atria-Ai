@@ -38,6 +38,7 @@ AKUN_FILE = BASE_DIR / "daftar_akun.txt"
 HASIL_FILE = BASE_DIR / "hasil.txt"
 GAGAL_FILE = BASE_DIR / "akun_gagal.txt"
 LOG_FILE = BASE_DIR / "catatan.log"
+SYNC_FILE = BASE_DIR / ".router_sync.json"
 
 C = CONFIG
 
@@ -95,6 +96,20 @@ def save_hasil(email, key, quota=0):
 def save_gagal(email, reason):
     with open(GAGAL_FILE, "a", encoding="utf-8") as f:
         f.write(f"{email}:{reason}\n")
+
+
+def load_sync():
+    """Catatan key yang sudah dipush ke 9router: {email: key}."""
+    if not SYNC_FILE.exists():
+        return {}
+    try:
+        return json.loads(SYNC_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_sync(sync):
+    SYNC_FILE.write_text(json.dumps(sync, indent=0), encoding="utf-8")
 
 
 # --- validasi key via HTTP (murni, tanpa browser) ---------------------
@@ -323,6 +338,23 @@ class Router:
         except Exception:
             return None
 
+    def delete_conn(self, cid):
+        try:
+            return self.c.delete(f"/api/providers/{cid}").status_code in (200, 204)
+        except Exception:
+            return False
+
+    def replace_key(self, email, key):
+        """Sync: hapus connection lama, buat ulang pakai key baru.
+        Return connection id baru, atau None."""
+        old = self.existing.get(email)
+        if old:
+            self.delete_conn(old["id"])
+        cid = self.inject(email, key)
+        if cid:
+            self.existing[email] = {"id": cid, "name": email}
+        return cid
+
     def test_conn(self, cid):
         try:
             r = self.c.post(f"/api/providers/{cid}/test", timeout=120)
@@ -400,8 +432,8 @@ def preflight(use_router):
 
 
 # --- satu akun --------------------------------------------------------
-async def process_one(email, password, router):
-    """Login -> key via HTTP -> validasi -> (inject + test kalau router).
+async def process_one(email, password, router, sync):
+    """Login -> key via HTTP -> validasi -> (sync + test kalau router).
     Return (key, quota) jika sukses, (None, reason) kalau gagal."""
     last_err = "unknown"
     for attempt in range(1, C["MAX_RETRY"] + 1):
@@ -419,35 +451,41 @@ async def process_one(email, password, router):
                         await asyncio.sleep(C["RETRY_DELAY"])
                     continue
 
-                # key via HTTP (cepat, tanpa reload halaman)
                 quota = await read_quota_rsc(p)
                 key = await create_key_http(p)
                 if not key:
                     last_err = "key-kosong"
                     continue
 
-                # validasi
                 if not await validate_key_async(key):
                     last_err = "key-invalid-401"
                     log(f"    key dibuat tapi tidak valid")
                     continue
 
-                # inject + test kalau mode 9router
                 if router is not None:
-                    if email in router.existing:
-                        log(f"    sudah ada di 9router, skip inject")
+                    pushed = sync.get(email)
+                    if pushed == key:
+                        log(f"    9router sudah pakai key ini, skip")
                     else:
-                        cid = router.inject(email, key)
-                        if not cid:
-                            log(f"    inject gagal (key tetap disimpan)")
+                        if email in router.existing:
+                            log(f"    update koneksi 9router (hapus + buat ulang)...")
+                            cid = router.replace_key(email, key)
                         else:
+                            cid = router.inject(email, key)
+                        if not cid:
+                            log(f"    inject/update gagal (key tetap disimpan)")
+                        else:
+                            if pushed:
+                                log(f"    key lama diganti key baru (sync)")
                             valid, raw = router.test_conn(cid)
                             if valid:
-                                log(f"    inject OK, test: AKTIF")
+                                log(f"    test: AKTIF")
                             else:
                                 await asyncio.sleep(3)
                                 valid, raw = router.test_conn(cid)
-                                log(f"    inject OK, test: {'AKTIF' if valid else 'GAGAL'}")
+                                log(f"    test: {'AKTIF' if valid else 'GAGAL'}")
+                            sync[email] = key
+                            save_sync(sync)
 
                 return key, quota
         except Exception as e:
@@ -455,6 +493,38 @@ async def process_one(email, password, router):
             if attempt < C["MAX_RETRY"]:
                 await asyncio.sleep(C["RETRY_DELAY"])
     return None, last_err
+
+
+# --- sync koneksi lama dgn key terbaru --------------------------------
+def sync_connections(router, sync):
+    """Bandingkan hasil.txt vs 9router, update yang key-nya beda."""
+    pairs = load_existing()
+    if not pairs:
+        return 0, 0
+    upd, skip = 0, 0
+    print(f"\n  Sync {len(pairs)} key dari {HASIL_FILE.name} ke 9router...")
+    for email, key in pairs.items():
+        conn = router.existing.get(email)
+        if conn is None:
+            skip += 1
+            continue
+        if sync.get(email) == key:
+            skip += 1
+            continue
+        cid = router.replace_key(email, key)
+        if cid:
+            valid, _ = router.test_conn(cid)
+            if not valid:
+                time.sleep(3)
+                valid, _ = router.test_conn(cid)
+            sync[email] = key
+            save_sync(sync)
+            upd += 1
+            print(f"    {email:<30} {'AKTIF' if valid else 'GAGAL'} (key diupdate)")
+        else:
+            print(f"    {email:<30} gagal update")
+    print(f"  Sync selesai: {upd} diupdate, {skip} sudah sama\n")
+    return upd, skip
 
 
 # --- mode: retest saja ------------------------------------------------
@@ -537,13 +607,16 @@ async def main(use_router=True, test_only=False):
     print(f"  Akan diproses: {len(todo)}\n")
 
     router = None
+    sync = {}
     if use_router:
         router = Router()
         router.login()
         node = router.find_node()
         n_existing = router.load_existing()
+        sync = load_sync()
         print(f"  9router: node '{node.get('name')}' prefix '{node.get('prefix')}'")
-        print(f"  koneksi Atria sekarang: {n_existing}\n")
+        print(f"  koneksi Atria sekarang: {n_existing}")
+        sync_connections(router, sync)
 
     if not todo:
         print("  Semua akun sudah punya key valid. Selesai.")
@@ -556,7 +629,7 @@ async def main(use_router=True, test_only=False):
 
     for i, (email, pw) in enumerate(todo, 1):
         log(f"  [{i}/{len(todo)}] {email}")
-        key, info = await process_one(email, pw, router)
+        key, info = await process_one(email, pw, router, sync)
         if key:
             ok_count += 1
             quota = info if isinstance(info, int) else 0

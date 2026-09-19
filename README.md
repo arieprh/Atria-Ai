@@ -89,12 +89,25 @@ Kalau belum ada, buat dulu:
 - Base URL: `https://api.atria-asi.ai/v1`
 - Prefix: `atr` (atau apa saja yang mengandung "atria")
 
+## Sinkronisasi hasil.txt ↔ 9Router
+
+Setiap kali mode 9Router dijalankan, script **menyamakan** koneksi di
+9Router dengan key terbaru di `hasil.txt`:
+
+- Akun yang key-nya di 9Router **beda** dari `hasil.txt` → koneksi lama
+  dihapus, dibuat ulang pakai key terbaru
+- Akun yang sudah sama → di-skip
+- Dicatat di `.router_sync.json` (pelacak key terakhir yang dipush)
+
+Jadi `hasil.txt` dan 9Router selalu sinkron.
+
 ## Yang terjadi otomatis
 
 - **Startup:** semua key lama di `hasil.txt` divalidasi via `/v1/models`
   (8 paralel). Key invalid dibuang otomatis.
+- **Startup (mode 9Router):** sync koneksi 9Router ke key terbaru
 - **Per akun:** login Google → bikin key via HTTP → **validasi key** →
-  (mode 9Router) inject + test langsung
+  (mode 9Router) inject/update + test langsung
 - **Baca quota** sisa token per akun (dari RSC payload `/console`)
 - **Jeda acak** 2.5–5 detik antar akun (hindari rate-limit Google)
 - **Retry** 3x kalau ada yang gagal
@@ -111,6 +124,7 @@ Kalau belum ada, buat dulu:
 | `hasil.txt` | OUTPUT: `email;apikey;quota` (akun sukses) |
 | `akun_gagal.txt` | OUTPUT: `email:password` (akun gagal) |
 | `catatan.log` | Log setiap run |
+| `.router_sync.json` | Pelacak key terakhir yang dipush ke 9Router (auto) |
 
 ## config.py — opsi lengkap
 
