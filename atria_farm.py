@@ -1,17 +1,27 @@
 ﻿"""
 Atria Farm — @arieprh
 ====================
-Login GSuite -> buat API key -> inject ke 9router, per akun berurutan.
-Anti rate-limit: sequential + jeda acak + retry backoff.
+Login GSuite -> buat API key -> (opsional) inject + test ke 9router,
+per akun berurutan. Anti rate-limit: sequential + jeda acak + retry.
 
-Pakai: isi akun.txt, lalu jalankan run.bat
+Pilih launcher:
+  run.bat          farm saja, simpan key ke hasil.txt (tanpa 9Router)
+  run_9router.bat  farm + inject + test langsung ke 9Router
+  run_test.bat     re-test koneksi 9Router yang sudah ada (tanpa farm)
+
+File:
+  daftar_akun.txt  INPUT  : email:password per baris
+  hasil.txt        OUTPUT : email;apikey (akun sukses)
+  akun_gagal.txt   OUTPUT : email:password (akun gagal)
 """
+import argparse
 import asyncio
 import json
 import random
 import re
 import sys
 import time
+import webbrowser
 from pathlib import Path
 
 import httpx
@@ -21,15 +31,15 @@ from config import CONFIG
 
 BASE = Path(__file__).parent
 ATRIA = "https://api.atria-asi.ai"
-AKUN_FILE = BASE / "akun.txt"
-API_FILE = BASE / "api.txt"
-SUCCESS_FILE = BASE / "success_akun.txt"
-FAILED_FILE = BASE / "failed_akun.txt"
+AKUN_FILE = BASE / "daftar_akun.txt"
+HASIL_FILE = BASE / "hasil.txt"
+GAGAL_FILE = BASE / "akun_gagal.txt"
+LOG_FILE = BASE / "catatan.log"
 
 C = CONFIG
 
 
-# --- util ---
+# --- util -------------------------------------------------------------
 def log(msg):
     ts = time.strftime("%H:%M:%S")
     print(f"  [{ts}] {msg}")
@@ -55,10 +65,10 @@ def load_accounts():
 
 
 def done_emails():
-    if not API_FILE.exists():
+    if not HASIL_FILE.exists():
         return set()
     out = set()
-    for line in API_FILE.read_text(encoding="utf-8-sig").splitlines():
+    for line in HASIL_FILE.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -69,17 +79,22 @@ def done_emails():
     return out
 
 
-def save_key(email, key):
-    with open(API_FILE, "a", encoding="utf-8") as f:
+def save_hasil(email, key):
+    with open(HASIL_FILE, "a", encoding="utf-8") as f:
         f.write(f"{email};{key}\n")
 
 
-def save_list(path, email, pw):
-    with open(path, "a", encoding="utf-8") as f:
+def save_gagal(email, pw):
+    with open(GAGAL_FILE, "a", encoding="utf-8") as f:
         f.write(f"{email}:{pw}\n")
 
 
-# --- google login ---
+def write_log(msg):
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+
+
+# --- google login -----------------------------------------------------
 async def _snapshot(p):
     try:
         return await p.evaluate("""() => ({
@@ -106,7 +121,6 @@ async def google_login(p, email, password):
 
     deadline = time.time() + C["LOGIN_TIMEOUT"]
 
-    # email
     warned = False
     while time.time() < deadline:
         await asyncio.sleep(1)
@@ -129,7 +143,6 @@ async def google_login(p, email, password):
     else:
         return False
 
-    # password + gates
     warned = False
     while time.time() < deadline:
         await asyncio.sleep(1)
@@ -216,17 +229,17 @@ async def create_api_key(p):
     return None
 
 
-# --- 9router ---
+# --- 9router ----------------------------------------------------------
 class Router:
     def __init__(self):
         self.c = httpx.Client(base_url=C["ROUTER_URL"], timeout=120)
         self.node = None
-        self.existing = set()
+        self.existing = {}
 
     def login(self):
         r = self.c.post("/api/auth/login", json={"password": C["ROUTER_PASSWORD"]})
         if r.status_code != 200 or not r.json().get("success"):
-            raise SystemExit(f"  9router login gagal: {r.text[:120]}")
+            raise SystemExit("login gagal")
 
     def find_node(self):
         r = self.c.get("/api/provider-nodes")
@@ -240,12 +253,11 @@ class Router:
     def load_existing(self):
         r = self.c.get("/api/providers")
         conns = r.json().get("connections", [])
-        self.existing = {c.get("name") for c in conns if c.get("provider") == self.node["id"]}
+        self.existing = {c.get("name"): c for c in conns
+                         if c.get("provider") == self.node["id"]}
         return len(self.existing)
 
     def inject(self, email, key):
-        if email in self.existing:
-            return "sudah ada"
         body = {
             "provider": self.node["id"],
             "apiKey": key,
@@ -254,31 +266,94 @@ class Router:
             "defaultModel": C["DEFAULT_MODEL"],
         }
         r = self.c.post("/api/providers", json=body)
-        if r.status_code in (200, 201):
-            self.existing.add(email)
-            return "ok"
-        return f"fail {r.status_code}: {r.text[:100]}"
-
-    def verify_all(self):
-        r = self.c.get("/api/providers")
-        conns = r.json().get("connections", [])
-        mine = [c for c in conns if c.get("provider") == self.node["id"]]
-        results = []
-        for c in mine:
-            valid = bool(c.get("testStatus") == "active")
-            results.append((c.get("name"), valid, c.get("testStatus")))
-        return results
-
-    def test_one(self, cid):
-        r = self.c.post(f"/api/providers/{cid}/test", timeout=120)
+        if r.status_code not in (200, 201):
+            return None
         try:
-            return r.json().get("valid", False)
+            return (r.json().get("connection") or {}).get("id")
         except Exception:
+            return None
+
+    def test_conn(self, cid):
+        try:
+            r = self.c.post(f"/api/providers/{cid}/test", timeout=120)
+            d = r.json()
+            return bool(d.get("valid")), d
+        except Exception as e:
+            return False, {"error": str(e)[:80]}
+
+
+# --- preflight --------------------------------------------------------
+def preflight(use_router):
+    """Cek syarat. use_router=False -> skip cek 9Router."""
+    print("\n  CEK SYARAT:")
+
+    if use_router:
+        url = C.get("ROUTER_URL", "").strip()
+        pw = C.get("ROUTER_PASSWORD", "").strip()
+        cfg_bad = (not url or "kamu" in url or not pw or "password-kamu" in pw)
+        print(f"    [{'v' if not cfg_bad else 'X'}] config.py ROUTER_URL / ROUTER_PASSWORD")
+        if cfg_bad:
+            print("\n  [!] config.py belum diisi.")
+            print("      Buka config.py, isi dua baris ini:")
+            print('        "ROUTER_URL":       "https://9router.kamu.com",')
+            print('        "ROUTER_PASSWORD":  "password-kamu",')
+            if sys.stdin.isatty():
+                try:
+                    a = input("\n  Buka config.py sekarang? [Y/n] ").strip().lower()
+                    if a in ("", "y", "ya"):
+                        webbrowser.open(str((BASE / "config.py").as_uri()))
+                        print("  >> Isi config.py, save, lalu jalankan lagi.")
+                except EOFError:
+                    pass
             return False
 
+        router = Router()
+        try:
+            router.login()
+            print(f"    [v] 9Router terhubung: {C['ROUTER_URL']}")
+        except SystemExit:
+            print(f"    [X] 9Router: URL salah atau server tidak merespons")
+            print(f"      Cek ROUTER_URL di config.py (sekarang: {C['ROUTER_URL']})")
+            return False
+        except Exception as e:
+            ename = type(e).__name__
+            hint = ""
+            if "Connect" in ename or "Timeout" in ename:
+                hint = "\n      Server tidak terjangkau. Cek apakah 9Router sedang jalan."
+            elif "Unsupported" in ename or "Protocol" in ename:
+                hint = "\n      URL salah format. Contoh: https://9router.kamu.com"
+            print(f"    [X] 9Router tidak bisa dihubungi / password salah")
+            print(f"      {ename}: {str(e)[:80]}{hint}")
+            return False
 
-# --- satu akun ---
+        node = router.find_node()
+        print(f"    [{'v' if node else 'X'}] Node 'atria' di 9Router")
+        if not node:
+            print("\n  [!] Node Atria belum dibuat di 9Router.")
+            print("      Buka dashboard 9Router -> Providers -> buat node:")
+            print("        Type     : anthropic-compatible")
+            print("        Base URL : https://api.atria-asi.ai/v1")
+            print("        Prefix   : atr   (harus mengandung kata 'atria')")
+            print("\n      Setelah node jadi, jalankan lagi.")
+            return False
+
+    accounts = load_accounts()
+    print(f"    [{'v' if accounts else 'X'}] daftar_akun.txt berisi {len(accounts)} akun")
+    if not accounts:
+        print("\n  [!] daftar_akun.txt masih kosong (hanya komentar).")
+        print("      Buka daftar_akun.txt, hapus baris '#', tulis akun GSuite:")
+        print("        email1@domain.com:password1")
+        print("        email2@domain.com:password2")
+        return False
+
+    print("\n  Semua syarat OK. Mulai farm...\n")
+    return True
+
+
+# --- satu akun --------------------------------------------------------
 async def process_one(email, password, router):
+    """Login -> key -> (inject + test kalau router aktif).
+    Return key jika sukses, None kalau gagal."""
     for attempt in range(1, C["MAX_RETRY"] + 1):
         try:
             async with AsyncCamoufox(headless=True, humanize=True) as br:
@@ -287,7 +362,7 @@ async def process_one(email, password, router):
 
                 ok = await google_login(p, email, password)
                 if not ok:
-                    log(f"  {email}: login gagal (attempt {attempt}/{C['MAX_RETRY']})")
+                    log(f"    login gagal (attempt {attempt}/{C['MAX_RETRY']})")
                     if attempt < C["MAX_RETRY"]:
                         wt = C["BACKOFF"] * attempt
                         log(f"    tunggu {wt}s sebelum retry...")
@@ -303,135 +378,116 @@ async def process_one(email, password, router):
 
                 key = await create_api_key(p)
                 if not key:
-                    log(f"  {email}: key gagal (attempt {attempt}/{C['MAX_RETRY']})")
+                    log(f"    key gagal (attempt {attempt}/{C['MAX_RETRY']})")
                     if attempt < C["MAX_RETRY"]:
                         wt = C["BACKOFF"] * attempt
                         log(f"    tunggu {wt}s sebelum retry...")
                         await asyncio.sleep(wt)
                     continue
 
-                save_key(email, key)
-                res = router.inject(email, key)
-                log(f"  {email}: key ok -> inject: {res}")
-                return True
+                if router is not None:
+                    if email in router.existing:
+                        log(f"    sudah ada di 9router, skip inject")
+                    else:
+                        cid = router.inject(email, key)
+                        if not cid:
+                            log(f"    inject gagal (key tetap disimpan)")
+                        else:
+                            valid, raw = router.test_conn(cid)
+                            if valid:
+                                log(f"    inject OK, test: AKTIF")
+                            else:
+                                err = str(raw.get("error", ""))[:60] if isinstance(raw, dict) else ""
+                                log(f"    inject OK, test: GAGAL {err}")
+                                await asyncio.sleep(3)
+                                valid, raw = router.test_conn(cid)
+                                log(f"    test ulang: {'AKTIF' if valid else 'GAGAL'}")
+                return key
         except Exception as e:
-            log(f"  {email}: error {type(e).__name__}: {str(e)[:80]}")
+            log(f"    error {type(e).__name__}: {str(e)[:80]}")
             if attempt < C["MAX_RETRY"]:
                 await asyncio.sleep(C["BACKOFF"] * attempt)
-    return False
+    return None
 
 
-# --- main ---
-# --- preflight: cek semua syarat sebelum mulai -------------------------
-def preflight():
-    """Cek config + 9router + node + akun. Berhenti kalau ada yang belum siap."""
-    print("\n  CEK SYARAT:")
-    ok_all = True
-
-    # 1. config.py
-    url = C.get("ROUTER_URL", "").strip()
-    pw = C.get("ROUTER_PASSWORD", "").strip()
-    cfg_bad = (not url or "kamu" in url or not pw or "password-kamu" in pw)
-    print(f"    [{'v' if not cfg_bad else 'X'}] config.py ROUTER_URL / ROUTER_PASSWORD")
-    if cfg_bad:
-        ok_all = False
-        print("\n  [!] config.py belum diisi.")
-        print("      Buka config.py, isi dua baris ini:")
-        print('        "ROUTER_URL":       "https://9router.kamu.com",')
-        print('        "ROUTER_PASSWORD":  "password-kamu",')
-        if sys.stdin.isatty():
-            try:
-                a = input("\n  Buka config.py sekarang? [Y/n] ").strip().lower()
-                if a in ("", "y", "ya"):
-                    import webbrowser
-                    webbrowser.open(str((BASE / "config.py").as_uri()))
-                    print("  >> Isi config.py, save, lalu jalankan run.bat lagi.")
-            except EOFError:
-                pass
-        return False
-
-    # 2. koneksi + login 9router
+# --- mode: retest saja ------------------------------------------------
+def run_retest():
+    """Re-test semua koneksi Atria di 9Router, GAGAL di-retry."""
+    print("\n  MODE: re-test koneksi 9Router (tanpa farm)\n")
     router = Router()
     try:
         router.login()
-        print(f"    [v] 9Router terhubung: {C['ROUTER_URL']}")
-    except SystemExit:
-        ok_all = False
-        print(f"    [X] 9Router: URL salah atau server tidak merespons")
-        print(f"      Cek ROUTER_URL di config.py (sekarang: {C['ROUTER_URL']})")
-        return False
-    except Exception as e:
-        ok_all = False
-        ename = type(e).__name__
-        hint = ""
-        if "Connect" in ename or "Timeout" in ename:
-            hint = "\n      Server tidak terjangkau. Cek apakah 9Router sedang jalan."
-        elif "Unsupported" in ename or "Protocol" in ename:
-            hint = "\n      URL salah format. Contoh yang benar: https://9router.kamu.com"
-        print(f"    [X] 9Router tidak bisa dihubungi / password salah")
-        print(f"      {ename}: {str(e)[:80]}{hint}")
-        print(f"      Cek ROUTER_URL & ROUTER_PASSWORD di config.py")
-        return False
-
-    # 3. node Atria
+    except Exception:
+        print("  [!] 9Router tidak terhubung. Cek config.py.")
+        return
     node = router.find_node()
-    print(f"    [{'v' if node else 'X'}] Node 'atria' di 9Router")
     if not node:
-        ok_all = False
-        print("\n  [!] Node Atria belum dibuat di 9Router.")
-        print("      Buka dashboard 9Router -> Providers -> buat node:")
-        print("        Type     : anthropic-compatible")
-        print("        Base URL : https://api.atria-asi.ai/v1")
-        print("        Prefix   : atr   (harus mengandung kata 'atria')")
-        print("\n      Setelah node jadi, jalankan run.bat lagi.")
-        return False
+        print("  [!] Node 'atria' belum dibuat di 9Router.")
+        return
 
-    # 4. akun.txt ada isinya
-    accounts = load_accounts()
-    n_real = len([a for a in accounts if not a[0].startswith("#")])
-    print(f"    [{'v' if n_real else 'X'}] akun.txt berisi {n_real} akun")
-    if not n_real:
-        ok_all = False
-        print("\n  [!] akun.txt masih kosong (hanya komentar).")
-        print("      Buka akun.txt, hapus baris '#', tulis akun GSuite:")
-        print("        email1@domain.com:password1")
-        print("        email2@domain.com:password2")
-        return False
+    n = router.load_existing()
+    print(f"  Node '{node.get('name')}' — {n} koneksi Atria\n")
+    print("  Testing satu per satu...\n")
 
-    print("\n  Semua syarat OK. Mulai farm...\n")
-    return True
+    active, still_bad = 0, []
+    for name, c in sorted(router.existing.items()):
+        valid, _ = router.test_conn(c["id"])
+        if valid:
+            active += 1
+            print(f"  {name:<30} AKTIF")
+            continue
+        print(f"  {name:<30} GAGAL -> retry...")
+        time.sleep(4)
+        valid, _ = router.test_conn(c["id"])
+        if valid:
+            active += 1
+            print(f"  {name:<30} AKTIF (setelah retry)")
+        else:
+            still_bad.append(name)
+            print(f"  {name:<30} GAGAL")
+
+    print("\n" + "=" * 50)
+    print(f"  Aktif: {active}/{n}")
+    if still_bad:
+        print(f"  Masih gagal: {', '.join(still_bad)}")
+        print("  Key ini kemungkinan expired/banned. Farm ulang akunnya.")
+    print("=" * 50)
+    write_log(f"retest: active={active}/{n} bad={len(still_bad)}")
 
 
-async def main():
+# --- main -------------------------------------------------------------
+async def main(use_router=True, test_only=False):
     print("=" * 50)
     print("         ATRIA FARM  —  @arieprh")
-    print("   GSuite login -> key -> inject 9router")
+    if test_only:
+        print("   Re-test koneksi 9Router")
+    elif use_router:
+        print("   GSuite login -> key -> inject + test 9Router")
+    else:
+        print("   GSuite login -> key (simpan ke hasil.txt)")
     print("=" * 50)
 
-    if not preflight():
+    if test_only:
+        run_retest()
+        return
+
+    if not preflight(use_router):
         return
 
     accounts = load_accounts()
-    if not accounts:
-        print("\n  akun.txt kosong! Format: email:password per baris")
-        return
-
     already = done_emails()
     todo = [a for a in accounts if a[0] not in already]
-    print(f"\n  {len(accounts)} akun dibaca, {len(already)} sudah ada key (skip)")
-    print(f"  Akan diproses: {len(todo)}")
-    if not todo:
-        print("\n  Semua akun sudah punya key. Lanjut verifikasi 9router.")
-    print()
+    print(f"  {len(accounts)} akun dibaca, {len(already)} sudah ada key (skip)")
+    print(f"  Akan diproses: {len(todo)}\n")
 
-    # preflight sudah pastikan login + node ada; tinggal muat koneksi
-    router = Router()
-    router.login()
-    node = router.find_node()
-    n_existing = router.load_existing()
-    print(f"  9router: node '{node.get('name')}' prefix '{node.get('prefix')}'")
-    print(f"  koneksi Atria sekarang: {n_existing}")
-    print()
+    router = None
+    if use_router:
+        router = Router()
+        router.login()
+        node = router.find_node()
+        n_existing = router.load_existing()
+        print(f"  9router: node '{node.get('name')}' prefix '{node.get('prefix')}'")
+        print(f"  koneksi Atria sekarang: {n_existing}\n")
 
     ok_count = 0
     failed = []
@@ -439,23 +495,18 @@ async def main():
 
     for i, (email, pw) in enumerate(todo, 1):
         log(f"  [{i}/{len(todo)}] {email}")
-        if email in router.existing:
-            log(f"  {email}: sudah ada di 9router, skip")
+        key = await process_one(email, pw, router)
+        if key:
             ok_count += 1
-            continue
-        ok = await process_one(email, pw, router)
-        if ok:
-            ok_count += 1
-            save_list(SUCCESS_FILE, email, pw)
+            save_hasil(email, key)
         else:
             failed.append((email, pw))
-            save_list(FAILED_FILE, email, pw)
+            save_gagal(email, pw)
         if i < len(todo):
             delay = random.randint(C["MIN_DELAY"], C["MAX_DELAY"])
-            log(f"  jeda {delay}s (anti rate-limit)...")
+            log(f"  jeda {delay}s (anti rate-limit)...\n")
             await asyncio.sleep(delay)
 
-    # bersihkan akun.txt
     moved = {a[0] for a in todo}
     remaining = [a for a in accounts if a[0] not in moved]
     with open(AKUN_FILE, "w", encoding="utf-8") as f:
@@ -464,7 +515,7 @@ async def main():
 
     elapsed = time.time() - start
     print("\n" + "=" * 50)
-    print("                HASIL FARM")
+    print("                   HASIL FARM")
     print("=" * 50)
     print(f"  Diproses : {len(todo)} akun dalam {elapsed:.0f}s")
     print(f"  Sukses   : {ok_count}")
@@ -472,43 +523,25 @@ async def main():
     if failed:
         for email, _ in failed:
             print(f"    - {email}")
-    print()
-
-    # ---# verifikasi akhir ##
-    print("=" * 50)
-    print("            VERIFIKASI 9ROUTER")
-    print("=" * 50)
-    r = router.c.get("/api/providers")
-    conns = r.json().get("connections", [])
-    mine = [c for c in conns if c.get("provider") == node["id"]]
-    print(f"  Total koneksi Atria: {len(mine)}")
-    print(f"  Testing satu per satu...\n")
-
-    active = 0
-    inactive = []
-    for c in sorted(mine, key=lambda v: v.get("name", "")):
-        valid = router.test_one(c["id"])
-        status = "AKTIF" if valid else "GAGAL"
-        if valid:
-            active += 1
-        else:
-            inactive.append(c.get("name"))
-        print(f"  {c.get('name'):<28} {status}")
-
-    print(f"\n  Aktif: {active}/{len(mine)}")
-    if inactive:
-        print(f"  Perlu cek: {', '.join(inactive)}")
+    print(f"\n  Key tersimpan   : {HASIL_FILE.name}")
+    if failed:
+        print(f"  Akun gagal      : {GAGAL_FILE.name}")
     print("=" * 50)
 
-    with open(BASE / "farm.log", "a", encoding="utf-8") as f:
-        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
-                f"processed={len(todo)} ok={ok_count} fail={len(failed)} "
-                f"router_active={active}/{len(mine)}\n")
+    write_log(f"mode={'router' if use_router else 'farm'} "
+              f"processed={len(todo)} ok={ok_count} fail={len(failed)} "
+              f"time={elapsed:.0f}s")
 
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser(description="Atria Farm — @arieprh")
+    ap.add_argument("--no-router", action="store_true",
+                    help="farm saja, tanpa inject 9Router")
+    ap.add_argument("--test-only", action="store_true",
+                    help="re-test koneksi 9Router yang sudah ada")
+    args = ap.parse_args()
     try:
-        asyncio.run(main())
+        asyncio.run(main(use_router=not args.no_router, test_only=args.test_only))
     except KeyboardInterrupt:
         print("\n  Dihentikan manual.")
     finally:
@@ -517,8 +550,3 @@ if __name__ == "__main__":
                 input("\n  Tekan Enter untuk keluar...")
         except EOFError:
             pass
-
-
-
-
-

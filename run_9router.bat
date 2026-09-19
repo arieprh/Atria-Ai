@@ -1,5 +1,5 @@
 @echo off
-title Atria Farm - farm saja
+title Atria Farm - farm + inject 9Router
 cd /d "%~dp0"
 set PYTHONIOENCODING=utf-8
 mode con: cols=90 lines=40
@@ -30,6 +30,8 @@ if %ERRORLEVEL% NEQ 0 (
     python -m camoufox fetch
 )
 
-echo [*] MODE: farm saja (key disimpan ke hasil.txt, tanpa 9Router)
-python atria_farm.py --no-router
+echo [*] MODE: farm + inject + test ke 9Router
+echo [*] Pastikan config.py sudah diisi (ROUTER_URL + ROUTER_PASSWORD)
+echo.
+python atria_farm.py
 pause

@@ -12,12 +12,22 @@ akun GSuite → login Google → API key Atria → inject 9router → test
 Anti rate-limit: **sequential** (1 akun pada satu waktu) + jeda acak +
 retry backoff. Bukan paralel 10 window.
 
+## Pilih launcher
+
+| Launcher | Fungsi |
+|----------|--------|
+| `run.bat` / `run.sh` | **Farm saja** — login + key, simpan ke `hasil.txt`. Tidak butuh 9Router. |
+| `run_9router.bat` / `run_9router.sh` | **Farm + inject + test** — setiap key langsung dipush ke 9Router dan ditest. |
+| `run_test.bat` / `run_test.sh` | **Re-test saja** — test ulang koneksi 9Router yang sudah ada, GAGAL di-retry otomatis. Tanpa farm. |
+
+> Tidak pakai 9Router? Klik `run.bat` saja, `config.py` tidak perlu diisi.
+
 ## Persiapan (sekali saja)
 
 ### Windows
 1. Install Python 3.10+ dari https://python.org/downloads
    — centang **"Add Python to PATH"**
-2. Klik 2x `run.bat`
+2. Klik 2x salah satu launcher (lihat tabel di atas)
 
 Script otomatis install dependensi + download browser Camoufox saat
 first run. Setelah itu langsung jalan.
@@ -27,7 +37,7 @@ first run. Setelah itu langsung jalan.
 sudo apt install python3 python3-pip   # Ubuntu/Debian
 # atau: sudo dnf install python3 python3-pip   (Fedora)
 
-chmod +x run.sh
+chmod +x run.sh   # (atau run_9router.sh / run_test.sh)
 ./run.sh
 ```
 
@@ -42,19 +52,30 @@ first run.
 
 ## Cara pakai
 
+### Mode farm saja (tidak pakai 9Router)
+1. Isi `daftar_akun.txt` — satu akun GSuite per baris:
+   ```
+   email1@domain.com:password1
+   email2@domain.com:password2
+   ```
+2. Klik `run.bat`
+3. Key tersimpan di `hasil.txt` dengan format `email;apikey`
+
+### Mode farm + 9Router
 1. **Edit `config.py`** — isi (WAJIB):
    ```
    ROUTER_URL        → url 9Router kamu, contoh https://9router.kamu.com
    ROUTER_PASSWORD   → password login 9Router kamu
    ```
-2. **Isi `akun.txt`** — satu akun GSuite per baris:
-   ```
-   email1@domain.com:password1
-   email2@domain.com:password2
-   ```
-3. **Jalankan** `run.bat` (Windows) / `./run.sh` (Linux)
-4. Tunggu sampai selesai. Laporan akhir menampilkan koneksi yang
-   **AKTIF** / **GAGAL**.
+2. Isi `daftar_akun.txt` (sama seperti di atas)
+3. Klik `run_9router.bat`
+4. Setiap akun: login → key → **inject + test langsung** ke 9Router
+
+### Mode re-test 9Router
+1. Pastikan `config.py` sudah diisi
+2. Klik `run_test.bat`
+3. Semua koneksi Atria di-test; yang GAGAL di-retry otomatis sekali
+   lagi. Kalau masih GAGAL → key expired/banned, farm ulang akunnya.
 
 ## Prasyarat 9Router
 
@@ -69,25 +90,26 @@ Kalau belum ada, buat dulu:
 
 ## Yang terjadi otomatis
 
-- **Per akun:** login Google → bikin key → **inject langsung** ke 9Router
+- **Per akun:** login Google → bikin key → (mode 9Router) **inject +
+  test langsung** ke 9Router
 - **Jeda acak** 8–16 detik antar akun (hindari rate-limit Google)
 - **Retry** 3x dengan backoff 30/60/90 detik kalau ada yang gagal
-- **Skip** otomatis: akun yang sudah punya key (`api.txt`) atau sudah
+- **Skip** otomatis: akun yang sudah ada key (`hasil.txt`) atau sudah
   ada di 9Router
-- **Akhir:** test semua koneksi satu per satu, laporan AKTIF/GAGAL
+- **Test GAGAL?** Jalan `run_test.bat` untuk re-test. Kalau masih
+  GAGAL, key expired — farm ulang akunnya.
 
 ## File
 
 | File | Keterangan |
 |------|-----------|
-| `run.bat` / `run.sh` | Launcher (auto-install dependensi) |
+| `run*.bat` / `run*.sh` | Launcher (auto-install dependensi) |
 | `atria_farm.py` | Script utama |
-| `config.py` | Konfigurasi — **EDIT INI** |
-| `akun.txt` | INPUT: daftar akun GSuite |
-| `api.txt` | OUTPUT: `email;key` (anti-duplikat) |
-| `success_akun.txt` | Akun yang berhasil |
-| `failed_akun.txt` | Akun yang gagal |
-| `farm.log` | Log setiap run |
+| `config.py` | Konfigurasi — **EDIT INI** (mode 9Router saja) |
+| `daftar_akun.txt` | INPUT: daftar akun GSuite |
+| `hasil.txt` | OUTPUT: `email;apikey` (akun sukses) |
+| `akun_gagal.txt` | OUTPUT: `email:password` (akun gagal) |
+| `catatan.log` | Log setiap run |
 
 ## config.py — opsi lengkap
 
@@ -105,7 +127,7 @@ Kalau belum ada, buat dulu:
 
 ## Retry akun gagal
 
-Pindah isi `failed_akun.txt` ke `akun.txt`, lalu jalankan lagi.
+Pindah isi `akun_gagal.txt` ke `daftar_akun.txt`, lalu jalankan lagi.
 Akun yang sudah sukses tidak akan diproses ulang.
 
 ## Catatan

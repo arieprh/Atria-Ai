@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+hasil.txt
+akun_gagal.txt
+catatan.log

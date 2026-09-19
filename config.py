@@ -1,6 +1,7 @@
 ﻿CONFIG = {
     # -- WAJIB EDIT ---------------------------------------------
     # Isi dengan URL & password 9Router kamu sendiri
+    # (tidak perlu diisi kalau pakai run.bat -- mode farm saja)
     "ROUTER_URL": "https://9router.kamu.com",
     "ROUTER_PASSWORD": "password-kamu",
     # -- OPTIONAL -----------------------------------------------

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Atria Farm — farm saja (tanpa 9Router)
+# Atria Farm — farm + inject + test ke 9Router
 set -e
 cd "$(dirname "$0")"
 export PYTHONIOENCODING=utf-8
@@ -19,5 +19,6 @@ if ! python3 -c "from camoufox.pkgman import installed_verstr; installed_verstr(
     python3 -m camoufox fetch
 fi
 
-echo "[*] MODE: farm saja (key ke hasil.txt, tanpa 9Router)"
-python3 atria_farm.py --no-router
+echo "[*] MODE: farm + inject + test ke 9Router"
+echo "[*] Pastikan config.py sudah diisi (ROUTER_URL + ROUTER_PASSWORD)"
+python3 atria_farm.py

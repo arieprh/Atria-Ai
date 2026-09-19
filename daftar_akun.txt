@@ -1,4 +1,4 @@
-﻿# akun.txt - isi dengan akun GSuite kamu, satu per baris
+﻿# daftar_akun.txt - isi dengan akun GSuite kamu, satu per baris
 # Format: email:password
 #
 # Hapus baris contoh ini, ganti dengan akun asli.
