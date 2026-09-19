@@ -10,7 +10,8 @@ akun GSuite → login Google → API key Atria → inject 9router → test
 ```
 
 Anti rate-limit: **sequential** (1 akun pada satu waktu) + jeda acak +
-retry backoff. Bukan paralel 10 window.
+retry. Key dibuat via **HTTP** dan divalidasi via `/v1/models` —
+bukan lewat klik tombol di halaman.
 
 ## Pilih launcher
 
@@ -59,7 +60,7 @@ first run.
    email2@domain.com:password2
    ```
 2. Klik `run.bat`
-3. Key tersimpan di `hasil.txt` dengan format `email;apikey`
+3. Key tersimpan di `hasil.txt` dengan format `email;apikey;quota`
 
 ### Mode farm + 9Router
 1. **Edit `config.py`** — isi (WAJIB):
@@ -90,14 +91,14 @@ Kalau belum ada, buat dulu:
 
 ## Yang terjadi otomatis
 
-- **Per akun:** login Google → bikin key → (mode 9Router) **inject +
-  test langsung** ke 9Router
-- **Jeda acak** 8–16 detik antar akun (hindari rate-limit Google)
-- **Retry** 3x dengan backoff 30/60/90 detik kalau ada yang gagal
-- **Skip** otomatis: akun yang sudah ada key (`hasil.txt`) atau sudah
-  ada di 9Router
-- **Test GAGAL?** Jalan `run_test.bat` untuk re-test. Kalau masih
-  GAGAL, key expired — farm ulang akunnya.
+- **Startup:** semua key lama di `hasil.txt` divalidasi via `/v1/models`
+  (8 paralel). Key invalid dibuang otomatis.
+- **Per akun:** login Google → bikin key via HTTP → **validasi key** →
+  (mode 9Router) inject + test langsung
+- **Baca quota** sisa token per akun (dari RSC payload `/console`)
+- **Jeda acak** 2.5–5 detik antar akun (hindari rate-limit Google)
+- **Retry** 3x kalau ada yang gagal
+- **Skip** otomatis: akun yang sudah ada key valid
 
 ## File
 
@@ -107,7 +108,7 @@ Kalau belum ada, buat dulu:
 | `atria_farm.py` | Script utama |
 | `config.py` | Konfigurasi — **EDIT INI** (mode 9Router saja) |
 | `daftar_akun.txt` | INPUT: daftar akun GSuite |
-| `hasil.txt` | OUTPUT: `email;apikey` (akun sukses) |
+| `hasil.txt` | OUTPUT: `email;apikey;quota` (akun sukses) |
 | `akun_gagal.txt` | OUTPUT: `email:password` (akun gagal) |
 | `catatan.log` | Log setiap run |
 
@@ -115,15 +116,17 @@ Kalau belum ada, buat dulu:
 
 | Key | Default | Keterangan |
 |-----|---------|------------|
-| `ROUTER_URL` | — | **WAJIB** url 9Router |
-| `ROUTER_PASSWORD` | — | **WAJIB** password 9Router |
-| `DEFAULT_MODEL` | `Atria-Dawn-Preview` | Model default koneksi |
-| `MIN_DELAY` | `8` | Jeda min antar akun (detik) |
-| `MAX_DELAY` | `16` | Jeda maks antar akun (detik) |
+| `ROUTER_URL` | — | **WAJIB** url 9Router (mode 9Router saja) |
+| `ROUTER_PASSWORD` | — | **WAJIB** password 9Router (mode 9Router saja) |
+| `MIN_DELAY` | `2.5` | Jeda min antar akun (detik) |
+| `MAX_DELAY` | `5.0` | Jeda maks antar akun (detik) |
 | `MAX_RETRY` | `3` | Retry per akun |
-| `BACKOFF` | `30` | Tunggu sebelum retry (× attempt) |
+| `RETRY_DELAY` | `2` | Tunggu sebelum retry (detik) |
 | `LOGIN_TIMEOUT` | `75` | Timeout login Google (detik) |
-| `KEY_TIMEOUT` | `60` | Timeout bikin key (detik) |
+| `KEY_TIMEOUT` | `20` | Timeout bikin key HTTP (detik) |
+| `VALIDATE_RETRY` | `5` | Retry validasi key |
+| `PURGE_WORKERS` | `8` | Paralel cek key lama saat startup |
+| `DEFAULT_MODEL` | `Atria-Dawn-Preview` | Model default koneksi 9Router |
 
 ## Retry akun gagal
 

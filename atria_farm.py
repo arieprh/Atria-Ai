@@ -1,8 +1,8 @@
 ﻿"""
 Atria Farm — @arieprh
 ====================
-Login GSuite -> buat API key -> (opsional) inject + test ke 9router,
-per akun berurutan. Anti rate-limit: sequential + jeda acak + retry.
+Login GSuite -> buat API key via HTTP -> validasi /v1/models ->
+(opsional) inject + test ke 9Router. Per akun berurutan.
 
 Pilih launcher:
   run.bat          farm saja, simpan key ke hasil.txt (tanpa 9Router)
@@ -11,8 +11,8 @@ Pilih launcher:
 
 File:
   daftar_akun.txt  INPUT  : email:password per baris
-  hasil.txt        OUTPUT : email;apikey (akun sukses)
-  akun_gagal.txt   OUTPUT : email:password (akun gagal)
+  hasil.txt        OUTPUT : email;apikey;quota (akun sukses)
+  akun_gagal.txt   OUTPUT : email:alasan (akun gagal)
 """
 import argparse
 import asyncio
@@ -21,7 +21,9 @@ import random
 import re
 import sys
 import time
+import urllib.request
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import httpx
@@ -29,12 +31,13 @@ from camoufox import AsyncCamoufox
 
 from config import CONFIG
 
-BASE = Path(__file__).parent
+BASE_DIR = Path(__file__).parent
 ATRIA = "https://api.atria-asi.ai"
-AKUN_FILE = BASE / "daftar_akun.txt"
-HASIL_FILE = BASE / "hasil.txt"
-GAGAL_FILE = BASE / "akun_gagal.txt"
-LOG_FILE = BASE / "catatan.log"
+MODELS = ATRIA + "/v1/models"
+AKUN_FILE = BASE_DIR / "daftar_akun.txt"
+HASIL_FILE = BASE_DIR / "hasil.txt"
+GAGAL_FILE = BASE_DIR / "akun_gagal.txt"
+LOG_FILE = BASE_DIR / "catatan.log"
 
 C = CONFIG
 
@@ -43,6 +46,11 @@ C = CONFIG
 def log(msg):
     ts = time.strftime("%H:%M:%S")
     print(f"  [{ts}] {msg}")
+
+
+def write_log(msg):
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
 
 
 def load_accounts():
@@ -64,34 +72,65 @@ def load_accounts():
     return out
 
 
-def done_emails():
+def load_existing():
+    """Baca hasil.txt -> {email: key}."""
     if not HASIL_FILE.exists():
-        return set()
-    out = set()
+        return {}
+    out = {}
     for line in HASIL_FILE.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line:
             continue
-        for sep in (";", ":", "|", ","):
-            if sep in line:
-                out.add(line.split(sep, 1)[0].strip())
-                break
+        parts = re.split(r"[;|,]", line)
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            out[parts[0].strip()] = parts[1].strip()
     return out
 
 
-def save_hasil(email, key):
+def save_hasil(email, key, quota=0):
     with open(HASIL_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{email};{key}\n")
+        f.write(f"{email};{key};{quota}\n")
 
 
-def save_gagal(email, pw):
+def save_gagal(email, reason):
     with open(GAGAL_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{email}:{pw}\n")
+        f.write(f"{email}:{reason}\n")
 
 
-def write_log(msg):
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+# --- validasi key via HTTP (murni, tanpa browser) ---------------------
+def key_is_valid(key):
+    try:
+        req = urllib.request.Request(MODELS, headers={"Authorization": f"Bearer {key}"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def purge_dead_keys():
+    """Cek semua key di hasil.txt, buang yang sudah invalid."""
+    existing = load_existing()
+    if not existing:
+        return 0, 0
+    with ThreadPoolExecutor(max_workers=C["PURGE_WORKERS"]) as ex:
+        futs = {ex.submit(key_is_valid, k): e for e, k in existing.items()}
+        valid = set()
+        for fut in as_completed(futs):
+            try:
+                if fut.result():
+                    valid.add(futs[fut])
+            except Exception:
+                pass
+    dead = set(existing) - valid
+    if dead:
+        kept = []
+        for line in HASIL_FILE.read_text(encoding="utf-8-sig").splitlines():
+            parts = re.split(r"[;|,]", line.strip())
+            if parts and parts[0].strip() not in dead:
+                kept.append(line)
+        with open(HASIL_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept) + ("\n" if kept else ""))
+    return len(valid), len(dead)
 
 
 # --- google login -----------------------------------------------------
@@ -194,39 +233,50 @@ async def google_login(p, email, password):
     return "atria" in p.url
 
 
-async def create_api_key(p):
-    deadline = time.time() + C["KEY_TIMEOUT"]
-    while time.time() < deadline:
-        try:
-            r = await p.evaluate("""async () => {
-                const res = await fetch('/api/keys', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({name: 'default'})
-                });
-                return {status: res.status, body: await res.text()};
-            }""")
-        except Exception:
-            await asyncio.sleep(2)
-            continue
-        st = r.get("status")
-        if st in (200, 201):
-            try:
-                data = json.loads(r["body"])
-            except Exception:
-                await asyncio.sleep(2)
-                continue
-            key = data.get("key") or data.get("apiKey") or ""
-            if not key:
-                m = re.search(r'"?(atr_\w+)"?', r["body"])
-                if m:
-                    key = m.group(1)
-            if key:
-                return key
-        elif st == 401:
-            return None
-        await asyncio.sleep(2)
-    return None
+# --- key via HTTP (lewat context browser, cookie sudah ada) -----------
+async def read_quota_rsc(p):
+    """Baca token_quota / token_used dari RSC payload /console."""
+    try:
+        r = await p.request.get(ATRIA + "/console?_rsc=farm", timeout=15000)
+        txt = await r.text()
+        mq = re.search(r'token_quota[\\"]*:\s*[\\"]*(\d+)', txt)
+        mu = re.search(r'token_used[\\"]*:\s*[\\"]*(\d+)', txt)
+        if mq:
+            q = int(mq.group(1))
+            used = int(mu.group(1)) if mu else 0
+            return max(0, q - used)
+    except Exception:
+        pass
+    return 0
+
+
+async def create_key_http(p):
+    """POST /api/keys via HTTP request context. Return key."""
+    r = await p.request.post(ATRIA + "/api/keys",
+                             data={"name": "atria"},
+                             timeout=C["KEY_TIMEOUT"] * 1000)
+    if r.status not in (200, 201):
+        raise RuntimeError(f"create-key-http-{r.status}")
+    try:
+        j = json.loads(await r.text())
+    except Exception:
+        raise RuntimeError("create-key-bad-json")
+    if isinstance(j, dict) and j.get("key"):
+        return j["key"]
+    if isinstance(j, list):
+        for it in j:
+            if isinstance(it, dict) and it.get("key"):
+                return it["key"]
+    raise RuntimeError("create-key-no-key-field")
+
+
+async def validate_key_async(key):
+    """Validasi via GET /v1/models. Loop sebanyak VALIDATE_RETRY."""
+    for _ in range(C["VALIDATE_RETRY"]):
+        if key_is_valid(key):
+            return True
+        await asyncio.sleep(1.0)
+    return False
 
 
 # --- 9router ----------------------------------------------------------
@@ -284,7 +334,6 @@ class Router:
 
 # --- preflight --------------------------------------------------------
 def preflight(use_router):
-    """Cek syarat. use_router=False -> skip cek 9Router."""
     print("\n  CEK SYARAT:")
 
     if use_router:
@@ -301,7 +350,7 @@ def preflight(use_router):
                 try:
                     a = input("\n  Buka config.py sekarang? [Y/n] ").strip().lower()
                     if a in ("", "y", "ya"):
-                        webbrowser.open(str((BASE / "config.py").as_uri()))
+                        webbrowser.open(str((BASE_DIR / "config.py").as_uri()))
                         print("  >> Isi config.py, save, lalu jalankan lagi.")
                 except EOFError:
                     pass
@@ -352,39 +401,38 @@ def preflight(use_router):
 
 # --- satu akun --------------------------------------------------------
 async def process_one(email, password, router):
-    """Login -> key -> (inject + test kalau router aktif).
-    Return key jika sukses, None kalau gagal."""
+    """Login -> key via HTTP -> validasi -> (inject + test kalau router).
+    Return (key, quota) jika sukses, (None, reason) kalau gagal."""
+    last_err = "unknown"
     for attempt in range(1, C["MAX_RETRY"] + 1):
         try:
             async with AsyncCamoufox(headless=True, humanize=True) as br:
-                p = await br.new_page()
-                await p.set_viewport_size({"width": 1280, "height": 900})
+                ctx = await br.new_context()
+                p = await ctx.new_page()
+                await p.set_viewport_size({"width": 1280, "height": 800})
 
                 ok = await google_login(p, email, password)
                 if not ok:
-                    log(f"    login gagal (attempt {attempt}/{C['MAX_RETRY']})")
+                    last_err = "login-gagal"
                     if attempt < C["MAX_RETRY"]:
-                        wt = C["BACKOFF"] * attempt
-                        log(f"    tunggu {wt}s sebelum retry...")
-                        await asyncio.sleep(wt)
+                        log(f"    login gagal (attempt {attempt}/{C['MAX_RETRY']})")
+                        await asyncio.sleep(C["RETRY_DELAY"])
                     continue
 
-                await asyncio.sleep(3)
-                try:
-                    await p.goto(f"{ATRIA}/console", wait_until="networkidle", timeout=30000)
-                except Exception:
-                    pass
-                await asyncio.sleep(2)
-
-                key = await create_api_key(p)
+                # key via HTTP (cepat, tanpa reload halaman)
+                quota = await read_quota_rsc(p)
+                key = await create_key_http(p)
                 if not key:
-                    log(f"    key gagal (attempt {attempt}/{C['MAX_RETRY']})")
-                    if attempt < C["MAX_RETRY"]:
-                        wt = C["BACKOFF"] * attempt
-                        log(f"    tunggu {wt}s sebelum retry...")
-                        await asyncio.sleep(wt)
+                    last_err = "key-kosong"
                     continue
 
+                # validasi
+                if not await validate_key_async(key):
+                    last_err = "key-invalid-401"
+                    log(f"    key dibuat tapi tidak valid")
+                    continue
+
+                # inject + test kalau mode 9router
                 if router is not None:
                     if email in router.existing:
                         log(f"    sudah ada di 9router, skip inject")
@@ -397,22 +445,20 @@ async def process_one(email, password, router):
                             if valid:
                                 log(f"    inject OK, test: AKTIF")
                             else:
-                                err = str(raw.get("error", ""))[:60] if isinstance(raw, dict) else ""
-                                log(f"    inject OK, test: GAGAL {err}")
                                 await asyncio.sleep(3)
                                 valid, raw = router.test_conn(cid)
-                                log(f"    test ulang: {'AKTIF' if valid else 'GAGAL'}")
-                return key
+                                log(f"    inject OK, test: {'AKTIF' if valid else 'GAGAL'}")
+
+                return key, quota
         except Exception as e:
-            log(f"    error {type(e).__name__}: {str(e)[:80]}")
+            last_err = f"{type(e).__name__}: {str(e)[:60]}"
             if attempt < C["MAX_RETRY"]:
-                await asyncio.sleep(C["BACKOFF"] * attempt)
-    return None
+                await asyncio.sleep(C["RETRY_DELAY"])
+    return None, last_err
 
 
 # --- mode: retest saja ------------------------------------------------
 def run_retest():
-    """Re-test semua koneksi Atria di 9Router, GAGAL di-retry."""
     print("\n  MODE: re-test koneksi 9Router (tanpa farm)\n")
     router = Router()
     try:
@@ -474,10 +520,20 @@ async def main(use_router=True, test_only=False):
     if not preflight(use_router):
         return
 
+    # purge key mati dulu
+    existing = load_existing()
+    if existing:
+        log(f"  Cek {len(existing)} key lama (validasi /v1/models)...")
+        valid_n, dead_n = purge_dead_keys()
+        if dead_n:
+            log(f"  {dead_n} key invalid dibuang, {valid_n} masih aktif")
+        else:
+            log(f"  Semua {valid_n} key masih valid")
+
     accounts = load_accounts()
-    already = done_emails()
+    already = set(load_existing())
     todo = [a for a in accounts if a[0] not in already]
-    print(f"  {len(accounts)} akun dibaca, {len(already)} sudah ada key (skip)")
+    print(f"\n  {len(accounts)} akun dibaca, {len(already)} sudah ada key (skip)")
     print(f"  Akan diproses: {len(todo)}\n")
 
     router = None
@@ -489,24 +545,33 @@ async def main(use_router=True, test_only=False):
         print(f"  9router: node '{node.get('name')}' prefix '{node.get('prefix')}'")
         print(f"  koneksi Atria sekarang: {n_existing}\n")
 
+    if not todo:
+        print("  Semua akun sudah punya key valid. Selesai.")
+        return
+
     ok_count = 0
     failed = []
+    total_tokens = 0
     start = time.time()
 
     for i, (email, pw) in enumerate(todo, 1):
         log(f"  [{i}/{len(todo)}] {email}")
-        key = await process_one(email, pw, router)
+        key, info = await process_one(email, pw, router)
         if key:
             ok_count += 1
-            save_hasil(email, key)
+            quota = info if isinstance(info, int) else 0
+            total_tokens += quota
+            save_hasil(email, key, quota)
+            log(f"    OK  quota={quota:,}")
         else:
-            failed.append((email, pw))
-            save_gagal(email, pw)
+            failed.append((email, info))
+            save_gagal(email, str(info))
+            log(f"    GAGAL  {info}")
         if i < len(todo):
-            delay = random.randint(C["MIN_DELAY"], C["MAX_DELAY"])
-            log(f"  jeda {delay}s (anti rate-limit)...\n")
+            delay = random.uniform(C["MIN_DELAY"], C["MAX_DELAY"])
             await asyncio.sleep(delay)
 
+    # konsumsi daftar_akun.txt
     moved = {a[0] for a in todo}
     remaining = [a for a in accounts if a[0] not in moved]
     with open(AKUN_FILE, "w", encoding="utf-8") as f:
@@ -514,23 +579,25 @@ async def main(use_router=True, test_only=False):
             f.write(f"{email}:{pw}\n")
 
     elapsed = time.time() - start
+    avg = elapsed / len(todo) if todo else 0
     print("\n" + "=" * 50)
     print("                   HASIL FARM")
     print("=" * 50)
-    print(f"  Diproses : {len(todo)} akun dalam {elapsed:.0f}s")
-    print(f"  Sukses   : {ok_count}")
-    print(f"  Gagal    : {len(failed)}")
+    print(f"  Diproses     : {len(todo)} akun dalam {elapsed:.0f}s ({avg:.1f}s/akun)")
+    print(f"  Sukses       : {ok_count}")
+    print(f"  Gagal        : {len(failed)}")
+    print(f"  Total token  : {total_tokens:,}")
     if failed:
-        for email, _ in failed:
-            print(f"    - {email}")
-    print(f"\n  Key tersimpan   : {HASIL_FILE.name}")
+        for email, reason in failed:
+            print(f"    - {email} ({reason})")
+    print(f"\n  Key tersimpan : {HASIL_FILE.name}")
     if failed:
-        print(f"  Akun gagal      : {GAGAL_FILE.name}")
+        print(f"  Akun gagal    : {GAGAL_FILE.name}")
     print("=" * 50)
 
     write_log(f"mode={'router' if use_router else 'farm'} "
               f"processed={len(todo)} ok={ok_count} fail={len(failed)} "
-              f"time={elapsed:.0f}s")
+              f"tokens={total_tokens} time={elapsed:.0f}s")
 
 
 if __name__ == "__main__":

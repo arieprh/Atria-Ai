@@ -1,15 +1,18 @@
 ﻿CONFIG = {
-    # -- WAJIB EDIT ---------------------------------------------
-    # Isi dengan URL & password 9Router kamu sendiri
-    # (tidak perlu diisi kalau pakai run.bat -- mode farm saja)
+    # -- WAJIB EDIT (mode 9Router saja) --------------------------
+    # Tidak perlu diisi kalau pakai run.bat (mode farm saja)
     "ROUTER_URL": "https://9router.kamu.com",
     "ROUTER_PASSWORD": "password-kamu",
-    # -- OPTIONAL -----------------------------------------------
-    "DEFAULT_MODEL": "Atria-Dawn-Preview",
-    "MIN_DELAY": 8,        # detik jeda minimum antar akun
-    "MAX_DELAY": 16,       # detik jeda maksimum antar akun
+    # -- KECEPATAN ------------------------------------------------
+    "MIN_DELAY": 2.5,      # detik jeda minimum antar akun
+    "MAX_DELAY": 5.0,      # detik jeda maksimum antar akun
     "MAX_RETRY": 3,        # retry per akun kalau gagal
-    "BACKOFF": 30,         # detik tunggu sebelum retry (x attempt)
+    "RETRY_DELAY": 2,      # detik tunggu sebelum retry login
+    # -- TIMEOUT --------------------------------------------------
     "LOGIN_TIMEOUT": 75,   # detik timeout login google
-    "KEY_TIMEOUT": 60,     # detik timeout pembuatan key
+    "KEY_TIMEOUT": 20,     # detik timeout bikin key (HTTP)
+    "VALIDATE_RETRY": 5,   # retry validasi key
+    # -- LAINNYA --------------------------------------------------
+    "DEFAULT_MODEL": "Atria-Dawn-Preview",
+    "PURGE_WORKERS": 8,    # paralel cek key lama saat purge
 }
