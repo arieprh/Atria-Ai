@@ -1,0 +1,9 @@
+﻿# akun.txt - isi dengan akun GSuite kamu, satu per baris
+# Format: email:password
+#
+# Hapus baris contoh ini, ganti dengan akun asli.
+# Separator: : ; | ,
+#
+# Contoh:
+#   akun1@domain.com:password1
+#   akun2@domain.com:password2
